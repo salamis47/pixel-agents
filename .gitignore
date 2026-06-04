@@ -16,6 +16,7 @@ Thumbs.db
 # IDE
 .vscode-test/
 /.idea
+.vs/
 
 # E2E test artifacts
 test-results/

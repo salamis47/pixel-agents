@@ -11,5 +11,7 @@
  * than reaching into each provider directory directly.
  */
 
+export { compositeProvider } from './composite.js';
+export { antigravityProvider } from './hook/antigravity/antigravity.js';
 export { claudeProvider } from './hook/claude/claude.js';
 export { copyHookScript } from './hook/claude/claudeHookInstaller.js';

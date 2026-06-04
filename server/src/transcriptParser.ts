@@ -54,6 +54,10 @@ export function processTranscriptLine(
   agent.linesProcessed++;
   try {
     const record = JSON.parse(line);
+    if (record.step_index !== undefined && record.source !== undefined) {
+      processAntigravityTranscriptLine(agentId, record, agents, waitingTimers, permissionTimers);
+      return;
+    }
 
     // -- Agent Teams: extract team metadata via the active provider --
     // The provider reads its CLI's own field names (Claude: record.teamName + record.agentName).
@@ -579,4 +583,140 @@ function isAsyncAgentResult(block: Record<string, unknown>): boolean {
     return content.startsWith('Async agent launched successfully.');
   }
   return false;
+}
+
+function processAntigravityTranscriptLine(
+  agentId: number,
+  record: any,
+  agents: AgentStateStore,
+  waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
+  permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
+): void {
+  const agent = agents.get(agentId);
+  if (!agent) return;
+
+  if (record.source === 'USER_EXPLICIT' && record.type === 'USER_INPUT') {
+    cancelWaitingTimer(agentId, waitingTimers);
+    clearAgentActivity(agent, agentId, agents, permissionTimers);
+    agent.hadToolsInTurn = false;
+    agents.broadcast({ type: 'agentStatus', id: agentId, status: 'active' });
+  } else if (record.source === 'MODEL' && record.type === 'PLANNER_RESPONSE') {
+    cancelWaitingTimer(agentId, waitingTimers);
+    agent.isWaiting = false;
+    agents.broadcast({ type: 'agentStatus', id: agentId, status: 'active' });
+
+    const toolCalls = record.tool_calls;
+    if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+      agent.hadToolsInTurn = true;
+      for (const call of toolCalls) {
+        const toolName = call.name;
+        const toolId = `${toolName}-${record.step_index}`;
+        const status = formatToolStatus(toolName, call.args || {});
+        
+        console.log(`[Pixel Agents] Antigravity: Agent ${agentId} - tool start: ${toolId} ${status}`);
+        
+        agent.activeToolIds.add(toolId);
+        agent.activeToolStatuses.set(toolId, status);
+        agent.activeToolNames.set(toolId, toolName);
+
+        const isSubagentSpawn = isSubagentTool(toolName);
+        
+        agents.broadcast({
+          type: 'agentToolStart',
+          id: agentId,
+          toolId,
+          status,
+          toolName,
+          permissionActive: agent.permissionSent,
+          runInBackground: isSubagentSpawn,
+        });
+
+        if (isSubagentSpawn) {
+          agents.broadcast({
+            type: 'subagentToolStart',
+            id: agentId,
+            parentToolId: toolId,
+            toolId: `${toolId}-sub`,
+            status: `Running subagent: ${toolName}`,
+          });
+        }
+      }
+    } else {
+      agent.hadToolsInTurn = false;
+      agent.isWaiting = true;
+      agents.broadcast({
+        type: 'agentStatus',
+        id: agentId,
+        status: 'waiting',
+      });
+    }
+  } else if (record.source === 'MODEL' && record.status === 'DONE' && record.type !== 'PLANNER_RESPONSE') {
+    const completedType = record.type;
+    let completedToolName = '';
+    switch (completedType) {
+      case 'RUN_COMMAND': completedToolName = 'run_command'; break;
+      case 'LIST_DIRECTORY': completedToolName = 'list_dir'; break;
+      case 'VIEW_FILE': completedToolName = 'view_file'; break;
+      case 'REPLACE_FILE_CONTENT': completedToolName = 'replace_file_content'; break;
+      case 'MULTI_REPLACE_FILE_CONTENT': completedToolName = 'multi_replace_file_content'; break;
+      case 'WRITE_TO_FILE': completedToolName = 'write_to_file'; break;
+      case 'GREP_SEARCH': completedToolName = 'grep_search'; break;
+      case 'SEARCH_WEB': completedToolName = 'search_web'; break;
+      case 'READ_URL_CONTENT': completedToolName = 'read_url_content'; break;
+      case 'BROWSER_SUBAGENT': completedToolName = 'browser_subagent'; break;
+      case 'ASK_QUESTION': completedToolName = 'ask_question'; break;
+      case 'ASK_PERMISSION': completedToolName = 'ask_permission'; break;
+      case 'CALL_MCP_TOOL': completedToolName = 'call_mcp_tool'; break;
+      case 'LIST_PERMISSIONS': completedToolName = 'list_permissions'; break;
+      case 'LIST_RESOURCES': completedToolName = 'list_resources'; break;
+      case 'READ_RESOURCE': completedToolName = 'read_resource'; break;
+      default:
+        completedToolName = completedType.toLowerCase();
+    }
+
+    let foundToolId: string | null = null;
+    for (const toolId of agent.activeToolIds) {
+      const activeName = agent.activeToolNames.get(toolId);
+      if (activeName === completedToolName) {
+        foundToolId = toolId;
+        break;
+      }
+    }
+
+    if (foundToolId) {
+      console.log(`[Pixel Agents] Antigravity: Agent ${agentId} - tool done: ${foundToolId}`);
+      
+      const isSubagent = isSubagentTool(completedToolName);
+      if (isSubagent) {
+        agents.broadcast({
+          type: 'subagentClear',
+          id: agentId,
+          parentToolId: foundToolId,
+        });
+      }
+
+      agent.activeToolIds.delete(foundToolId);
+      agent.activeToolStatuses.delete(foundToolId);
+      agent.activeToolNames.delete(foundToolId);
+
+      const toolId = foundToolId;
+      setTimeout(() => {
+        agents.broadcast({
+          type: 'agentToolDone',
+          id: agentId,
+          toolId,
+        });
+      }, TOOL_DONE_DELAY_MS);
+    }
+
+    if (agent.activeToolIds.size === 0) {
+      agent.hadToolsInTurn = false;
+      agent.isWaiting = true;
+      agents.broadcast({
+        type: 'agentStatus',
+        id: agentId,
+        status: 'waiting',
+      });
+    }
+  }
 }
